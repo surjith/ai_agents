@@ -5,6 +5,7 @@ import requests
 import gradio as gr
 import pandas as pd
 from schemas import RecordUserDetailsModel, RecordDataImprovementModel
+from system_prompt import SystemPrompt
 from pathlib import Path
 from PyPDF2 import PdfReader
 from openai import OpenAI
@@ -28,116 +29,35 @@ def read_pdf(path: str) -> str:
             text += t + "\n"
     return text.strip()
 
-metrics_df = pd.read_csv(Path(__file__).parent.parent / "data" / "finance.csv")
-metrics_csv = metrics_df.to_csv(index=False)
-overview = read_pdf(Path(__file__).parent.parent / "data" / "apple_company_overview.pdf")
-fy2024_context = read_pdf(Path(__file__).parent.parent / "data" / "apple_fy2024_context.pdf")
-fy2025_context = read_pdf(Path(__file__).parent.parent / "data" / "apple_fy2025_ytd_context.pdf")
-
-company_name = metrics_df['company_name'].iloc[0]
-ticker = metrics_df['ticker'].iloc[0]
-
-# ----------------------------
-# System prompt
-# # ----------------------------
-system_prompt = f"""
-You are a Fundamentals Narrator Agent for {company_name} ({ticker}).
-Your job is to answer user questions about {company_name}’s business performance using ONLY the provided sources:
-1) A quarterly metrics CSV (for all numbers and calculations)
-2) Supporting PDFs (for qualitative context and explanations)
-
-You must be accurate, clear, and trustworthy. You are NOT a stock picker and must not provide investment advice.
-
-## Sources & how to use them
-- CSV metrics table: authoritative for ALL numeric values, comparisons, and calculations.
-- PDFs: context only (business description and performance commentary). Use them to explain or contextualize changes observed in the CSV.
-
-## Core rules (follow strictly)
-1) Numbers rule (STRICT):
-   - ALL numeric values, comparisons, and calculations MUST come from the CSV.
-   - Do not guess or invent numbers.
-   - If the user asks for a metric that is not present in the CSV, you must say you don’t have it and call record_data_improvement.
-
-2) Context rule (STRICT):
-   - Use PDFs only to provide background context or to explain changes observed in the CSV.
-   - Do not invent explanations that are not supported by the PDFs or by general, non-specific financial reasoning.
-   - If PDFs do not contain enough context to answer "why", say so and call record_data_improvement.
-
-3) Scope rule (STRICT):
-   - You can only analyze {company_name} using the provided dataset.
-   - If the user asks about another company, comparisons, or adding a company, explain that only {company_name} is currently supported and call record_data_improvement.
-
-4) No investment advice (STRICT):
-   - Do not provide buy/sell recommendations, price targets, or stock price predictions.
-   - You may discuss business performance, financial health, and risks at a high level grounded in the provided data.
-
-5) Tool usage rules (STRICT):
-   A) record_user_details:
-      - If the user requests follow-up contact (e.g., “contact me”, “email me”, “get in touch later”, “send me updates”):
-        - Ask for their email address (and name if helpful), then call record_user_details with the details they provide.
-
-   B) record_data_improvement:
-      - If you cannot answer due to missing/insufficient data, you MUST call record_data_improvement.
-      - When calling record_data_improvement, you MUST include a category field using ONE of:
-        - "missing_metric"
-        - "missing_company"
-        - "missing_time_period"
-        - "missing_context_document"
-        - "schema_enhancement"
-      - Include:
-        - the user's original question,
-        - what is missing / why you can't answer,
-        - what data/document/column would be needed to answer next time.
-
-      Category selection guidance (use the best fit):
-      - missing_metric: the user asks for a metric not in the CSV (e.g., net income, ROIC, iPhone revenue).
-      - missing_company: the user asks to analyze/compare/add another company.
-      - missing_time_period: the user asks about a quarter/year not covered by the CSV.
-      - missing_context_document: the CSV shows a change but PDFs don't explain enough "why" (e.g., need earnings call transcript).
-      - schema_enhancement: data exists but the current table structure is insufficient (e.g., need segment breakdown table).
-
-      Examples:
-      - User: “What is Apple’s ROIC in FY2024?” -> category="missing_metric"
-      - User: “Compare Apple vs Google margins.” -> category="missing_company"
-      - User: “What happened in FY2022 Q2?” (not in CSV) -> category="missing_time_period"
-      - User: “Why did margins drop in 2024-Q3?” (PDFs don’t say) -> category="missing_context_document"
-
-## How to answer (structure)
-- Briefly restate the question.
-- Use the CSV to state the relevant values and changes (include quarter labels).
-- Explain why it matters (plain English).
-- Add supporting context from PDFs if relevant.
-- End with caveats/limitations if needed, and log a data improvement request if you cannot fully answer.
-
-## Provided data
-### CSV metrics (authoritative for numbers)
-{metrics_csv}
-
-# ### Company overview (context)
-# {overview}
-
-# ### FY2024 context (context)
-# {fy2024_context}
-
-# ### FY2025 YTD context (context)
-# {fy2025_context}
-
-# With this context, chat with the user and follow the rules above.
-# """.strip()
 
 '''Data recording tools using Pydantic models from schemas.py'''
 record_user_details_json = RecordUserDetailsModel.model_json_schema()
 record_data_improvement_json = RecordDataImprovementModel.model_json_schema()
 
-'''Define tools for the agent'''
+'''Define tools for the agent (OpenAI function/tool format)'''
+# Each function entry must include a `name`, `description`, and `parameters` (JSON Schema).
+# We reuse the Pydantic-generated JSON schema as the `parameters` value.
 tools = [
-    {"type": "function", "function": record_user_details_json},
-    {"type": "function", "function": record_data_improvement_json}
+    {
+        "type": "function",
+        "function": {
+            "name": "record_user_details",
+            "description": "Record a user's contact details (email, name, notes) for follow-up.",
+            "parameters": record_user_details_json,
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_data_improvement",
+            "description": "Record a request for missing or improved data, including a category.",
+            "parameters": record_data_improvement_json,
+        },
+    },
 ]
 
-def push():
-   
-    message = "This is a test message from the Pushover API."
+def push(message: str = "This is a test message from the Pushover API."):
+    """Send a message via Pushover (defaults to a test message)."""
     data = {
         "user": pushover_user_key,
         "token": pushover_app_token,
@@ -154,53 +74,96 @@ def push():
 
 
 def record_user_details(email, name="Name not provided", notes="No notes"):
-    push(f"Recording interest from {name} with email {email} and notes {notes}")
+    try:        
+        validated = RecordUserDetailsModel.model_validate({"email": email, "name": name, "notes": notes})        
+    except Exception as e:
+        return {"error": f"Invalid input: {e}"}
+    
+    data = validated.model_dump()
+    msg = f"Recording interest from {data['name']} with email {data['email']} and notes {data['notes']}"
+    push(msg)
+    return {"recorded": "ok", "data": data}
+
+def record_data_improvement(question, category=None, details=None):
+    msg = f"Recording data request that I couldn't answer: {question}"
+    if category:
+        msg += f" | category: {category}"
+    if details:
+        msg += f" | details: {details}"
+    push(msg)
     return {"recorded": "ok"}
 
-def record_data_improvement(question):
-    push(f"Recording data request that I couldn't answer: {question}")
-    return {"recorded": "ok"}
 
 def handle_tool_invocation(tool_calls):
-   results = []
-   for tool_call in tool_calls:
+    """Execute model-requested tool calls and return tool output messages to append to the conversation."""
+    results = []
+    for tool_call in tool_calls:
         tool_name = tool_call.function.name
-        arguments = json.loads(tool_call.function.arguments)
+        try:
+            arguments = json.loads(tool_call.function.arguments)
+        except Exception as e:
+            print(f"Failed to parse tool arguments for {tool_name}: {e}")
+            arguments = {}
+
         print(f"Invoking tool: {tool_name} with arguments: {arguments}")
-        # Get the tool function by name
         tool = globals().get(tool_name)
-        result = tool(**arguments) if tool else None
+        try:
+            result = tool(**arguments) if tool else {"error": "tool not found"}
+        except Exception as e:
+            result = {"error": str(e)}
+
+        # Represent tool output as a message the model can see
         results.append({"role": "tool","content": json.dumps(result),"tool_call_id": tool_call.id})
 
-def chat(message, history):
+    return results
 
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": message}]
-    done = False
-    while not done:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            tools=tools,
-            tool_invocation="auto"
-        )
+class FundamentalsAgent:
+    def __init__(self):
+        self.system_prompt_builder = SystemPrompt()
+        metrics_df = pd.read_csv(Path(__file__).parent.parent / "data" / "finance.csv")
+        self.company_name = metrics_df['company_name'].iloc[0]
+        self.ticker = metrics_df['ticker'].iloc[0]
+
+        metrics_csv = metrics_df.to_csv(index=False)
+        overview = read_pdf(Path(__file__).parent.parent / "data" / "apple_company_overview.pdf")
+        fy2024_context = read_pdf(Path(__file__).parent.parent / "data" / "apple_fy2024_context.pdf")
+        fy2025_context = read_pdf(Path(__file__).parent.parent / "data" / "apple_fy2025_ytd_context.pdf")
         
-        finish_reason = response.choices[0].finish_reason
+        self.system_prompt = self.system_prompt_builder.BuildSystemPrompt(
+            company_name=self.company_name,
+            ticker=self.ticker,
+            metrics_csv=metrics_csv,
+            overview=overview,
+            fy2024_context=fy2024_context,
+            fy2025_context=fy2025_context,
+        )
 
-        if finish_reason == "tool_calls":
-            message = response.choices[0].message
-            tool_calls = message.tool_calls
-            results = handle_tool_invocation(tool_calls)
-            messages.append(message)
-            messages.extend(results)
-        else:
-            done = True
-    return response.choices[0].message.content
+    def chat(self, message, history):
 
-'''Gradio UI'''
-gr.ChatInterface(chat, type="messages").launch()
-# gr.ChatInterface(
-#     fn=chat,
-#     type="messages",
-#     title=f"{company_name} Fundamentals Narrator",
-#     description=f"Ask questions about {company_name}'s business performance based on the provided data.",
-# ).launch()
+        messages = [{"role": "system", "content": self.system_prompt}] + history + [{"role": "user", "content": message}]
+        done = False
+        final_content = None
+        while not done:        
+            response = openai_client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=messages,
+                tools=tools
+            )        
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason == "tool_calls":
+                message = response.choices[0].message
+                # Add the assistant's message (may be empty when it triggers tool calls)
+                # assistant_message = {"role": "assistant", "content": msg_obj.content or ""}
+                tool_calls = message.tool_calls
+                results = handle_tool_invocation(tool_calls)
+                messages.append(message)
+                messages.extend(results)
+            else:
+                done = True
+
+        return response.choices[0].message.content
+
+if __name__ == "__main__":
+    agent = FundamentalsAgent()  
+    '''Gradio UI'''
+    gr.ChatInterface(fn=agent.chat, title=f"{agent.company_name} Fundamentals Narrator", description=f"Ask questions about {agent.company_name}'s business performance based on the provided data.").launch()
