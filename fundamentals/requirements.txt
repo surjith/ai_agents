@@ -1,0 +1,9 @@
+requests
+os
+dotenv
+json
+gradio
+pandas
+pathlib
+PyPDF2
+openai
